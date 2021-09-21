@@ -11,7 +11,7 @@ entity spi_master is
     port(clk_i, rst_n_i, en_i       : in  std_logic;
          dv_o                 : out std_logic;
          data_i               : in  std_logic_vector(FRAME_LENGTH - 1 downto 0);
-         data_o               : in  std_logic_vector(FRAME_LENGTH - 1 downto 0);
+         data_o               : out  std_logic_vector(FRAME_LENGTH - 1 downto 0);
          miso_i               : in  std_logic; --Master In Slave Out
          mosi_o               : out std_logic; --Master Out Slave In
          sclk_o               : out std_logic; --Serial clock
@@ -21,16 +21,23 @@ end entity;
 
 architecture arc of spi_master is
 
-    type state_type is (IDLE, START, TRANSFER, STOP);
+    type state_type is (IDLE, START, TRANSFER, STOP, FINISH);
 
     signal state : state_type;
     signal shift_reg : std_logic_vector(data_i'range);
-    signal sclk_counter : integer range 0 to (2*CLK_DIVIDER)-1;
-    signal index : integer range 0 to FRAME_LENGTH - 1;
+    
+    signal en_sclk_counter : std_logic;
     signal sclk : std_logic;
+    signal sclk_counter : integer range 0 to CLK_DIVIDER;
+    signal sclk_rising_edge, sclk_falling_edge : std_logic;
+    signal r1_edge,r2_edge :std_logic;
+    signal index : integer range -1 to FRAME_LENGTH;
+   
 
     begin
-        sclk_o <= sclk;
+        sclk_o <= r2_edge;
+        sclk_rising_edge <= not(r2_edge) and r1_edge;
+        sclk_falling_edge <= r2_edge and not(r1_edge);
 
         TRANSFER_PROC : process(clk_i,rst_n_i)
             begin
@@ -38,17 +45,16 @@ architecture arc of spi_master is
                     shift_reg <= (others=> '0');
                     dv_o <= '0';
                     mosi_o <= '0';
-                    sclk <= CPOL;
                     ss_n_o <= '1';
-                    sclk_counter <= 0;
+                    en_sclk_counter <= '0';
                     state <= IDLE;
                 elsif rising_edge(clk_i) then
                     case state is
                         when IDLE =>
                             dv_o <= '0';
                             mosi_o <= '0';
-                            sclk <= CPOL;
                             ss_n_o <= '1';
+                            en_sclk_counter <= '0';
                             if en_i = '1' then
                                 state <= START;
                             else
@@ -57,59 +63,95 @@ architecture arc of spi_master is
                         when START =>
                             dv_o <= '1';
                             ss_n_o <= '0';
-                            sclk_counter <= 0;
+                            en_sclk_counter <= '1';
                             index <= FRAME_LENGTH - 1;
                             shift_reg <= data_i;
-                            state <= START;
+                            if CPHA = '0' then
+                                mosi_o <= data_i(FRAME_LENGTH - 1);
+                            end if;
+                            state <= TRANSFER;
                         when TRANSFER =>
+                            
+                            if index >= 0 then
+                                if sclk_rising_edge = '1' then
+                                    if CPOL = '0' then
+                                        if CPHA = '0' then --read miso
+                                            shift_reg(index) <= miso_i;
+                                            index <= index - 1;
+                                        else --write mosi
+                                            mosi_o <= shift_reg(index);
+                                        end if;
+                                    else
+                                        if CPHA = '0' then --write miso
+                                            mosi_o <= shift_reg(index);
+                                        else --read mosi
+                                            shift_reg(index) <= miso_i;
+                                            index <= index - 1;
+                                        end if;
 
-                            sclk_counter <= sclk_counter + 1;
-                            index <= index - 1;
-                            if sclk_counter = CLK_DIVIDER - 1 then
-                                sclk <= not sclk;
-                                if CPOL = '0' then
-                                    if sclk = '0' then --rising sclk edge
-                                        if CPHA = '0' then --read miso
-                                            shift_reg(index) <= miso_i;
-                                        else --write mosi
-                                            mosi_o <= shift_reg(index);
-                                        end if;
-                                    else --falling sclk edge
-                                        if CPHA = '0' then --write mosi
-                                            mosi_o <= shift_reg(index);
-                                        else --read miso
-                                            shift_reg(index) <= miso_i;
-                                        end if;
                                     end if;
-                                else
-                                    if sclk = '1' then --falling sclk edge
+                                end if;
+
+                                if sclk_falling_edge = '1' then
+                                    if CPOL = '0' then
+                                        if CPHA = '0' then --write miso
+                                            mosi_o <= shift_reg(index);
+                                        else --read mosi
+                                            shift_reg(index) <= miso_i;
+                                            index <= index - 1;
+                                        end if;
+                                    else
                                         if CPHA = '0' then --read miso
                                             shift_reg(index) <= miso_i;
+                                            index <= index - 1;
                                         else --write mosi
                                             mosi_o <= shift_reg(index);
-                                        end if;
-                                    else --rising sclk edge
-                                        if CPHA = '0' then --write mosi
-                                            mosi_o <= shift_reg(index);
-                                        else --read miso
-                                            shift_reg(index) <= miso_i;
                                         end if;
                                     end if;
                                 end if;
-                            end if;
-
-                            if index = 0 then
-                                state <= STOP;
                             else
-                                state <= TRANSFER;
+                                state <= STOP;
                             end if;
 
                         when STOP =>
-                            sclk <= CPOL;
+
+                            if (sclk_falling_edge = '1' or sclk_rising_edge = '1') then
+                                state <= FINISH;
+                            end if;
+
+                        when FINISH =>
+                            en_sclk_counter <= '0';
                             dv_o <= '0';
                             ss_n_o <= '1';
+                            data_o <= shift_reg;
                             state <= IDLE;
                     end case;
+                end if;
+        end process;
+
+        SCLK_PROC : process(clk_i)
+            begin
+                if en_sclk_counter = '0' then
+                    sclk_counter <= 0;
+                    sclk <= CPOL;
+                elsif rising_edge (clk_i) then
+                    if sclk_counter < CLK_DIVIDER - 2 then
+                        sclk_counter <= sclk_counter + 1;
+                    else
+                        sclk_counter <= 0;
+                        sclk <= not sclk;
+                    end if;
+                end if;
+        end process;
+
+        EDGE_PROC : process(clk_i, rst_n_i)
+            begin
+                if rst_n_i = '0' then
+                    r1_edge <= '1';
+                    r2_edge <= '1';
+                elsif rising_edge(clk_i) then
+                    r1_edge <= sclk;
+                    r2_edge <= r1_edge;
                 end if;
         end process;
 
